@@ -1,0 +1,93 @@
+rules_version = '2';
+
+// Regras de segurança do Car Doce Car.
+// Perfis: users/{uid} = {name, email, role, unitId, active}
+// Agendamentos da unidade: users/{unitId}/appointments/{id}
+// Cargos (role): 'admin' (Administrativo), 'vendedor', 'operacional'.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profilePath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    // Logado, com perfil cadastrado e com acesso ativo.
+    function isActive() {
+      return signedIn() && exists(profilePath()) && get(profilePath()).data.active == true;
+    }
+
+    function myRole() {
+      return get(profilePath()).data.role;
+    }
+
+    function inUnit(unitId) {
+      return isActive() && get(profilePath()).data.unitId == unitId;
+    }
+
+    function isAdminOf(unitId) {
+      return inUnit(unitId) && myRole() == 'admin';
+    }
+
+    function validRole(role) {
+      return role in ['admin', 'vendedor', 'operacional'];
+    }
+
+    // ---------- Perfis de usuário ----------
+    match /users/{userId} {
+      // Cada um lê o próprio perfil; o administrativo lê os da sua unidade.
+      allow read: if signedIn()
+        && (request.auth.uid == userId || isAdminOf(resource.data.unitId));
+
+      // Administrativo cria logins apenas na própria unidade.
+      allow create: if isAdminOf(request.resource.data.unitId)
+        && userId != request.auth.uid
+        && validRole(request.resource.data.role)
+        && request.resource.data.active == true
+        && request.resource.data.keys().hasOnly(
+             ['name', 'email', 'role', 'unitId', 'active', 'createdAt', 'updatedAt']);
+
+      // Administrativo altera cargo, nome e ativo/desativado (nunca o próprio perfil
+      // e nunca a unidade), assim a unidade sempre mantém um administrativo.
+      allow update: if isAdminOf(resource.data.unitId)
+        && userId != request.auth.uid
+        && request.resource.data.unitId == resource.data.unitId
+        && validRole(request.resource.data.role)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'role', 'active', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    // ---------- Agendamentos / orçamentos da unidade ----------
+    match /users/{unitId}/appointments/{appointmentId} {
+      // Todos os cargos ativos da unidade visualizam.
+      allow read: if inUnit(unitId);
+
+      // Administrativo e vendedor lançam. O vendedor só lança como "em aberto".
+      allow create: if inUnit(unitId)
+        && (
+          myRole() == 'admin'
+          || (myRole() == 'vendedor'
+              && request.resource.data.isCompleted == false
+              && request.resource.data.isStarred == false)
+        );
+
+      // Administrativo altera tudo. O vendedor altera só as informações básicas
+      // (não mexe em valor, favorito nem conclusão do serviço).
+      allow update: if inUnit(unitId)
+        && (
+          myRole() == 'admin'
+          || (myRole() == 'vendedor'
+              && request.resource.data.diff(resource.data).affectedKeys()
+                   .hasOnly(['client', 'car', 'service', 'description', 'date', 'time', 'updatedAt']))
+        );
+
+      // Só o administrativo exclui.
+      allow delete: if isAdminOf(unitId);
+    }
+  }
+}
